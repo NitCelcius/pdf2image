@@ -1,233 +1,374 @@
-import { ContextMenuCommandBuilder, ApplicationCommandType, MessageFlags } from 'discord.js';
-import type { MessageContextMenuCommandInteraction, Message, Attachment } from 'discord.js';
 import { execFile } from 'child_process';
-import { promisify } from 'util';
-import fs from 'fs/promises';
+import {
+	ApplicationCommandType,
+	ContextMenuCommandBuilder,
+	MessageFlags,
+	type Attachment,
+	type Message,
+	type MessageContextMenuCommandInteraction,
+} from 'discord.js';
 import { createWriteStream } from 'fs';
-import https from 'https';
+import fs from 'fs/promises';
 import type { IncomingMessage } from 'http';
+import https from 'https';
 import os from 'os';
 import path from 'path';
+import { pipeline } from 'stream/promises';
+import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
 
-const downloadPdf = (url: string, filePath: string): Promise<void> => new Promise((resolve, reject) => {
-	console.log(`[Download] Starting download`);
-	const file = createWriteStream(filePath);
-	const request = https.get(url, (response: IncomingMessage) => {
-		if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
-			console.error(`[Download] Failed with status code: ${response.statusCode}`);
-			reject(new Error(`ファイルのダウンロードに失敗しました。ステータスコード: ${response.statusCode}`));
-			return;
+const DOWNLOAD_TIMEOUT_MS = 120_000;
+const CONVERT_TIMEOUT_MS = 120_000;
+const PROCESS_TIMEOUT_MS = 10 * 60 * 1000;
+const DISCORD_API_TIMEOUT_MS = 30_000;
+const MAX_BASE_FILENAME_LENGTH = 64;
+
+const LOW_DENSITY = 100;
+const MEDIUM_DENSITY = 120;
+const DEFAULT_DENSITY = 150;
+const CONVERT_BATCH_SIZE = 32;
+
+const CHECK_BOT_PERMISSIONS_MESSAGE = 'Botの権限設定を確認してください。';
+const GENERIC_ERROR = '変換処理に失敗しました。時間をおいて再試行してください。';
+const TIMEOUT_RETRY = '処理がタイムアウトしました。PDFのページ数を減らして再試行してください。';
+
+const APP_ERROR_MESSAGES = {
+	PROCESS_TIMEOUT: '処理時間が上限を超えました。PDFのページ数を減らして再試行してください。',
+	TARGET_MESSAGE_NOT_FOUND: '対象のメッセージが見つかりませんでした。',
+	NO_ATTACHMENTS: 'ファイルが添付されていません。',
+	NO_PDF_ATTACHMENTS: 'PDFファイルが添付されていません。',
+	DOWNLOAD_FAILED: 'PDFのダウンロードに失敗しました。時間をおいて再試行してください。',
+	UPLOAD_GENERATION_FAILED: '画像の生成に失敗しました。別のPDFで再試行してください。',
+	CHANNEL_SEND_UNAVAILABLE: `このチャンネルにはメッセージを送信できません。\n${CHECK_BOT_PERMISSIONS_MESSAGE}`,
+	BOT_SEND_PERMISSION: `Botにメッセージ送信権限がありません。\n${CHECK_BOT_PERMISSIONS_MESSAGE}`,
+	BOT_REQUIRED_PERMISSION: `Botに必要な権限がありません。\n${CHECK_BOT_PERMISSIONS_MESSAGE}`,
+	IMAGE_TOO_LARGE: '画像サイズが大きすぎて送信できませんでした。\nページ数を減らして再試行してください。',
+	CHANNEL_INFO_FAILED: 'チャンネル情報の取得に失敗しました。\nもう一度お試しください。',
+	RATE_LIMIT: '送信が混み合っています。時間をおいて再試行してください。',
+} as const;
+
+type AppErrorCode = keyof typeof APP_ERROR_MESSAGES;
+
+const DISCORD_ERROR_MAP: Record<string, AppErrorCode> = {
+	'50001': 'BOT_SEND_PERMISSION',
+	'50013': 'BOT_REQUIRED_PERMISSION',
+	'40005': 'IMAGE_TOO_LARGE',
+	ChannelNotCached: 'CHANNEL_INFO_FAILED',
+	'429': 'RATE_LIMIT',
+	'413': 'IMAGE_TOO_LARGE',
+};
+
+const throwAppError = (code: AppErrorCode): never => {
+	throw { code };
+};
+
+const getStepTimeoutMs = (deadlineAt: number, maxTimeoutMs: number): number => {
+	const remainingMs = deadlineAt - Date.now();
+	if (remainingMs <= 0) {
+		throwAppError('PROCESS_TIMEOUT');
+	}
+	return Math.min(remainingMs, maxTimeoutMs);
+};
+
+const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number): Promise<T> => {
+	const timeoutPromise = new Promise<T>((_, reject) => {
+		const timer = setTimeout(() => reject({ code: 'PROCESS_TIMEOUT' as const }), timeoutMs);
+		if (typeof timer.unref === 'function') {
+			timer.unref();
 		}
-		response.pipe(file);
 	});
 
-	request.on('error', (err) => {
-		console.error(`[Download] Request error:`, err);
-		reject(err);
-	});
+	return Promise.race([promise, timeoutPromise]);
+};
 
-	file.on('finish', () => {
-		console.log(`[Download] Completed`);
-		file.close(() => resolve());
-	});
+const isPdfAttachment = (attachment: Attachment): boolean => {
+	const contentType = attachment.contentType?.toLowerCase();
+	return contentType?.startsWith('application/pdf') || attachment.name?.toLowerCase().endsWith('.pdf') || false;
+};
 
-	file.on('error', async (err: Error) => {
-		console.error(`[Download] File write error:`, err);
+const sanitizeBaseFilename = (filename?: string): string => {
+	const base = (filename ?? 'file.pdf').replace(/\.[^.]*$/, '');
+	const sanitized = base
+		.replace(/[\\/:*?"<>|]/g, '_')
+		.replace(/[\x00-\x1F\x7F]/g, '_')
+		.trim();
+	return (sanitized || 'file').slice(0, MAX_BASE_FILENAME_LENGTH);
+};
+
+const chooseDensity = (sizeBytes: number): number => {
+	if (sizeBytes >= 60 * 1024 * 1024) {
+		return LOW_DENSITY;
+	}
+	if (sizeBytes >= 30 * 1024 * 1024) {
+		return MEDIUM_DENSITY;
+	}
+	return DEFAULT_DENSITY;
+};
+
+const downloadPdf = async (url: string, filePath: string, timeoutMs: number): Promise<void> => {
+	const cleanupFile = async (): Promise<void> => {
 		try {
 			await fs.unlink(filePath);
-		} catch (unlinkErr) {
-			console.error(`[Download] Failed to delete file: ${unlinkErr}`);
+		} catch {
+			// ignore cleanup errors
 		}
-		reject(err);
-	});
-});
+	};
 
-const convertPdfToWebps = async (pdfPath: string, webpPath: string): Promise<void> => {
+	await new Promise<void>((resolve, reject) => {
+		const request = https.get(url, (response: IncomingMessage) => {
+			void (async () => {
+				if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+					console.error(`[Download] Failed with status code: ${response.statusCode}`, { statusCode: response.statusCode });
+					response.resume();
+					await cleanupFile();
+					reject({ code: 'DOWNLOAD_FAILED' as const });
+					return;
+				}
+
+				const file = createWriteStream(filePath);
+				try {
+					await pipeline(response, file);
+					resolve();
+				} catch (error) {
+					console.error('[Download] Stream error:', error);
+					await cleanupFile();
+					reject(error);
+				}
+			})();
+		});
+
+		request.setTimeout(timeoutMs, () => {
+			const timeoutError = new Error('ファイルのダウンロードがタイムアウトしました。') as NodeJS.ErrnoException;
+			timeoutError.code = 'ETIMEDOUT';
+			request.destroy(timeoutError);
+		});
+
+		request.on('error', (error) => {
+			console.error('[Download] Request error:', error);
+			void cleanupFile().finally(() => reject(error));
+		});
+	});
+};
+
+const isResourceLimitError = (error: unknown): boolean => {
+	const message = `${error instanceof Error ? error.message : ''}\n${(error as { stderr?: unknown })?.stderr ?? ''}`;
+	return /cache resources exhausted|TooManyExceptions|IDAT: Too much image data/i.test(message);
+};
+
+const listGeneratedWebps = async (imageDir: string): Promise<string[]> => {
+	return (await fs.readdir(imageDir))
+		.filter((file) => file.endsWith('.webp'))
+		.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+		.map((file) => path.join(imageDir, file));
+};
+
+const clearGeneratedWebps = async (imageDir: string): Promise<void> => {
+	await Promise.all(
+		(await fs.readdir(imageDir))
+			.filter((file) => file.endsWith('.webp'))
+			.map((file) => fs.unlink(path.join(imageDir, file)).catch(() => { })),
+	);
+};
+
+const getPdfPageCount = async (pdfPath: string, deadlineAt: number): Promise<number> => {
+	const { stdout } = await execFileAsync('identify', ['-ping', '-format', '%p\n', pdfPath], {
+		timeout: getStepTimeoutMs(deadlineAt, CONVERT_TIMEOUT_MS),
+	});
+	const pageCount = String(stdout)
+		.split('\n')
+		.filter((line) => line.trim() !== '')
+		.length;
+	return Math.max(pageCount, 1);
+};
+
+const convertPdfToWebps = async (
+	pdfPath: string,
+	imageDir: string,
+	originalFilename: string,
+	initialDensity: number,
+	deadlineAt: number,
+): Promise<string[]> => {
+	const outputPattern = path.join(imageDir, `${originalFilename}_page_%03d.webp`);
+
+	const runConvert = async (density: number): Promise<void> => {
+		await execFileAsync('convert', ['-density', String(density), '-alpha', 'remove', pdfPath, outputPattern], {
+			timeout: getStepTimeoutMs(deadlineAt, CONVERT_TIMEOUT_MS),
+		});
+	};
+
+	const runBatchedConvert = async (density: number): Promise<void> => {
+		const pageCount = await getPdfPageCount(pdfPath, deadlineAt);
+		for (let start = 0; start < pageCount; start += CONVERT_BATCH_SIZE) {
+			const end = Math.min(start + CONVERT_BATCH_SIZE - 1, pageCount - 1);
+			await execFileAsync(
+				'convert',
+				[
+					'-density',
+					String(density),
+					'-alpha',
+					'remove',
+					`${pdfPath}[${start}-${end}]`,
+					'-scene',
+					String(start),
+					outputPattern,
+				],
+				{ timeout: getStepTimeoutMs(deadlineAt, CONVERT_TIMEOUT_MS) },
+			);
+		}
+	};
+
 	try {
-		console.log(`[Convert] Starting conversion`);
-		const startTime = Date.now();
-		await execFileAsync('convert', ['-density', '150', '-alpha', 'remove', pdfPath, webpPath]);
-		const duration = Date.now() - startTime;
-		console.log(`[Convert] Completed in ${duration}ms`);
+		await runConvert(initialDensity);
+		return listGeneratedWebps(imageDir);
 	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		console.error(`[Convert] Failed:`, error);
-		throw new Error(`PDFの変換中にエラーが発生しました。エラー: ${message}`);
+		const retryDensity = initialDensity > MEDIUM_DENSITY ? MEDIUM_DENSITY : (initialDensity > LOW_DENSITY ? LOW_DENSITY : null);
+		if (retryDensity === null || !isResourceLimitError(error)) {
+			console.error('[Convert] Failed:', error);
+			throw error;
+		}
+		await clearGeneratedWebps(imageDir);
+		try {
+			await runConvert(retryDensity);
+			return listGeneratedWebps(imageDir);
+		} catch (retryError) {
+			if (!isResourceLimitError(retryError)) {
+				console.error('[Convert] Failed after retry:', retryError);
+				throw retryError;
+			}
+			await clearGeneratedWebps(imageDir);
+			await runBatchedConvert(retryDensity);
+			return listGeneratedWebps(imageDir);
+		}
 	}
 };
 
-const sendWebps = async (targetMessage: Message, imageDir: string): Promise<void> => {
-	const filenames = await fs.readdir(imageDir);
-	const files = filenames.map(filename => path.join(imageDir, filename));
-	const totalFiles = files.length;
-	console.log(`[Upload] Sending ${totalFiles} images`);
-	const firstMessageFiles = (totalFiles - 1) % 9 + 1;
-	const subsequentMessageFiles = 9;
+const sendWebps = async (targetMessage: Message, files: string[], deadlineAt: number): Promise<void> => {
+	if (files.length === 0) {
+		throwAppError('UPLOAD_GENERATION_FAILED');
+	}
 
 	if (targetMessage.channel.partial) {
 		await targetMessage.channel.fetch();
 	}
 
-	let messageCount = 0;
-	for (let i = 0; i < totalFiles;) {
-		const maxFilesInMessage = (i === 0) ? firstMessageFiles : subsequentMessageFiles;
-		const filesToSend = files.slice(i, i + maxFilesInMessage);
-		messageCount++;
+	const firstMessageFiles = (files.length - 1) % 9 + 1;
+	for (let i = 0, messageIndex = 0; i < files.length; messageIndex++) {
+		const chunkSize = messageIndex === 0 ? firstMessageFiles : 9;
+		const filesToSend = files.slice(i, i + chunkSize);
 
 		try {
-			if (i === 0) {
-				await targetMessage.reply({
-					files: filesToSend,
-					allowedMentions: { repliedUser: false }
-				});
-			} else {
-				if ('send' in targetMessage.channel) {
-					await targetMessage.channel.send({
-						files: filesToSend
-					});
-				}
-			}
+			const sendPromise = messageIndex === 0
+				? targetMessage.reply({ files: filesToSend, allowedMentions: { repliedUser: false } })
+				: (() => {
+					const sendableChannel = targetMessage.channel as { send?: (options: { files: string[] }) => Promise<unknown> };
+					const send = sendableChannel.send?.bind(targetMessage.channel);
+					if (typeof send !== 'function') {
+						throwAppError('CHANNEL_SEND_UNAVAILABLE');
+					}
+					return (send as (options: { files: string[] }) => Promise<unknown>)({ files: filesToSend });
+				})();
+
+			await withTimeout(sendPromise, getStepTimeoutMs(deadlineAt, PROCESS_TIMEOUT_MS));
 		} catch (error) {
-			if (error && typeof error === 'object' && 'code' in error) {
-				if (error.code === 50001) {
-					throw new Error(
-						`Botにメッセージ送信権限がありません。\n` +
-						`Botの権限設定を確認してください。`
-					);
-				}
-				if (error.code === 'ChannelNotCached') {
-					throw new Error(
-						`チャンネル情報の取得に失敗しました。\n` +
-						`もう一度お試しください。`
-					);
+			if (error && typeof error === 'object') {
+				const mapped = DISCORD_ERROR_MAP[String((error as { code?: unknown }).code)]
+					?? DISCORD_ERROR_MAP[String((error as { status?: unknown }).status)];
+				if (mapped) {
+					throwAppError(mapped);
 				}
 			}
 			throw error;
 		}
 
-		console.log(`[Upload] Sent message ${messageCount} with ${filesToSend.length} images`);
-		i += maxFilesInMessage;
-	}
-	console.log(`[Upload] All images sent successfully`);
-};
-
-const cleanUp = async (filePath: string | undefined, dirPath: string | undefined): Promise<void> => {
-	try {
-		if (filePath) {
-			await fs.unlink(filePath).catch(() => {});
-		}
-		if (dirPath) {
-			await fs.rm(dirPath, { recursive: true, force: true });
-		}
-		console.log(`[Cleanup] Completed`);
-	} catch (error) {
-		console.error('[Cleanup] Error:', error);
+		i += chunkSize;
 	}
 };
 
-const processAttachment = async (
-	targetMessage: Message,
-	attachment: Attachment,
-	updateProgress: (message: string) => Promise<void>
-): Promise<void> => {
+const processAttachment = async (targetMessage: Message, attachment: Attachment): Promise<void> => {
 	let pdfPath: string | undefined;
 	let imageDir: string | undefined;
-	const startTime = Date.now();
+	const deadlineAt = Date.now() + PROCESS_TIMEOUT_MS;
 
 	try {
-		console.log(`[Process] Starting processing for: ${attachment.name} (${attachment.size} bytes)`);
-		const originalFilename = path.basename(attachment.name, '.pdf');
-		imageDir = await fs.mkdtemp(path.join(os.tmpdir(), originalFilename + "_"));
+		const originalFilename = sanitizeBaseFilename(attachment.name);
+		imageDir = await fs.mkdtemp(path.join(os.tmpdir(), `${originalFilename}_`));
 		pdfPath = path.join(path.dirname(imageDir), `${path.basename(imageDir)}.pdf`);
-		const webpPath = path.join(imageDir, originalFilename + '_page_%03d.webp');
 
-		await updateProgress(`ダウンロード中`);
-		await downloadPdf(attachment.url, pdfPath);
-
-		await updateProgress(`変換中`);
-		await convertPdfToWebps(pdfPath, webpPath);
-
-		await updateProgress(`アップロード中`);
-		await sendWebps(targetMessage, imageDir);
-
-		const duration = Date.now() - startTime;
-		console.log(`[Process] Completed processing for: ${attachment.name} in ${duration}ms`);
+		await downloadPdf(attachment.url, pdfPath, getStepTimeoutMs(deadlineAt, DOWNLOAD_TIMEOUT_MS));
+		const generatedFiles = await convertPdfToWebps(pdfPath, imageDir, originalFilename, chooseDensity(attachment.size), deadlineAt);
+		await sendWebps(targetMessage, generatedFiles, deadlineAt);
 	} catch (error) {
 		console.error(`[Process] Failed processing ${attachment.name}:`, error);
-		throw new Error(`PDF ${attachment.name} の変換中にエラーが発生しました。`);
+		throw error;
 	} finally {
-		await cleanUp(pdfPath, imageDir);
+		try {
+			await Promise.all([
+				pdfPath ? fs.unlink(pdfPath).catch(() => { }) : undefined,
+				imageDir ? fs.rm(imageDir, { recursive: true, force: true }) : undefined,
+			]);
+		} catch (cleanupError) {
+			console.error('[Cleanup] Error:', cleanupError);
+		}
 	}
+};
+
+const resolveUserMessage = (error: unknown): string => {
+	const code = (error as { code?: unknown } | null)?.code;
+	if (typeof code === 'string' && code in APP_ERROR_MESSAGES) {
+		return APP_ERROR_MESSAGES[code as AppErrorCode] ?? GENERIC_ERROR;
+	}
+
+	if (error instanceof Error) {
+		const err = error as { code?: unknown; killed?: unknown; signal?: unknown; message: string };
+		if (
+			err.code === 'ETIMEDOUT'
+			|| err.code === 'ESOCKETTIMEDOUT'
+			|| (err.killed === true && err.signal === 'SIGTERM')
+			|| /timed out|timeout|タイムアウト/i.test(err.message)
+		) {
+			return TIMEOUT_RETRY;
+		}
+	}
+
+	return GENERIC_ERROR;
 };
 
 export = {
-	data: new ContextMenuCommandBuilder()
-		.setName('convertPDF')
-		.setType(ApplicationCommandType.Message),
+	data: new ContextMenuCommandBuilder().setName('convertPDF').setType(ApplicationCommandType.Message),
 	async execute(interaction: MessageContextMenuCommandInteraction) {
-		const startTime = Date.now();
-		const guildName = interaction.guild?.name || 'DM';
-		console.log(`[Command] convertPDF executed by ${interaction.user.tag} in ${guildName}`);
-
 		try {
-			await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+			await withTimeout(interaction.deferReply({ flags: MessageFlags.Ephemeral }), DISCORD_API_TIMEOUT_MS);
 
 			const targetMessage = interaction.options.getMessage('message');
 			if (!targetMessage) {
-				console.log(`[Command] Target message not found`);
-				await interaction.editReply({
-					content: '対象のメッセージが見つかりませんでした。'
-				});
-				return;
+				throwAppError('TARGET_MESSAGE_NOT_FOUND');
 			}
+			const message = targetMessage!;
 
-			const attachments = Array.from(targetMessage.attachments.values());
-
-			if (attachments.length === 0) {
-				console.log(`[Command] No attachments found`);
-				await interaction.editReply({
-					content: 'ファイルが添付されていません。'
-				});
-				return;
-			}
-
-			const pdfAttachments = attachments.filter(attachment => attachment.name?.endsWith('.pdf'));
-
+			const pdfAttachments = Array.from(message.attachments.values()).filter(isPdfAttachment);
 			if (pdfAttachments.length === 0) {
-				console.log(`[Command] No PDF attachments found`);
-				await interaction.editReply({
-					content: 'PDFファイルが添付されていません。'
-				});
-				return;
+				throwAppError(message.attachments.size === 0 ? 'NO_ATTACHMENTS' : 'NO_PDF_ATTACHMENTS');
 			}
 
-			console.log(`[Command] Processing ${pdfAttachments.length} PDF(s)`);
-
-			const updateProgress = async (message: string) => {
-				await interaction.editReply({ content: message });
-			};
-
-			for (let i = 0; i < pdfAttachments.length; i++) {
-				const attachment = pdfAttachments[i];
-				const fileName = attachment.name || 'file';
-				const counter = pdfAttachments.length > 1 ? `[${i + 1}/${pdfAttachments.length}] ` : '';
-
-				await processAttachment(targetMessage, attachment, async (msg) => {
-					await updateProgress(`${counter}${msg} ${fileName}...`);
-				});
+			for (const attachment of pdfAttachments) {
+				await processAttachment(message, attachment);
 			}
 
-			await interaction.deleteReply();
-			const duration = Date.now() - startTime;
-			console.log(`[Command] convertPDF completed successfully in ${duration}ms`);
+			await withTimeout(interaction.editReply({ content: `${pdfAttachments.length}件のPDF変換が完了しました。` }), DISCORD_API_TIMEOUT_MS);
 		} catch (error) {
 			console.error('[Command] convertPDF failed:', error);
-			const message = error instanceof Error ? error.message : '不明なエラーが発生しました';
-			await interaction.editReply({
-				content: message
-			});
+			const userMessage = resolveUserMessage(error);
+			try {
+				await withTimeout(interaction.editReply({ content: userMessage }), DISCORD_API_TIMEOUT_MS);
+			} catch (replyError) {
+				console.error('[Command] editReply failed, trying followUp:', replyError);
+				try {
+					await withTimeout(interaction.followUp({ content: userMessage, flags: MessageFlags.Ephemeral }), DISCORD_API_TIMEOUT_MS);
+				} catch (followUpError) {
+					console.error('[Command] followUp also failed:', followUpError);
+				}
+			}
 		}
 	},
 };
