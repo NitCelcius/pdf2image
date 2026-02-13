@@ -337,6 +337,9 @@ const resolveUserMessage = (error: unknown): string => {
 export = {
 	data: new ContextMenuCommandBuilder().setName('convertPDF').setType(ApplicationCommandType.Message),
 	async execute(interaction: MessageContextMenuCommandInteraction) {
+		const guildName = interaction.guild?.name ?? 'DM';
+		console.log(`[Command] convertPDF executed in ${guildName} by ${interaction.user.tag}`);
+
 		try {
 			await withTimeout(interaction.deferReply({ flags: MessageFlags.Ephemeral }), DISCORD_API_TIMEOUT_MS);
 
