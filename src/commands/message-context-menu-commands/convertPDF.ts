@@ -248,6 +248,10 @@ const sendWebps = async (targetMessage: Message, files: string[], deadlineAt: nu
 		throwAppError('UPLOAD_GENERATION_FAILED');
 	}
 
+	if (!targetMessage.channel) {
+		throwAppError('CHANNEL_SEND_UNAVAILABLE');
+	}
+
 	if (targetMessage.channel.partial) {
 		await targetMessage.channel.fetch();
 	}
@@ -324,7 +328,7 @@ const resolveUserMessage = (error: unknown): string => {
 		if (
 			err.code === 'ETIMEDOUT'
 			|| err.code === 'ESOCKETTIMEDOUT'
-			|| (err.killed === true && err.signal === 'SIGTERM')
+			|| err.killed === true
 			|| /timed out|timeout|タイムアウト/i.test(err.message)
 		) {
 			return TIMEOUT_RETRY;
