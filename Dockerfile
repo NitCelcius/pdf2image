@@ -16,22 +16,20 @@ WORKDIR /app
 
 FROM base AS builder
 
-COPY package.json package-lock.json ./
+COPY package.json pnpm-lock.yaml ./
 
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci
+RUN npm install -g pnpm && pnpm install --frozen-lockfile
 
 COPY tsconfig.json ./
 COPY src ./src
 
-RUN npm run build
+RUN pnpm run build
 
 FROM base AS production
 
-COPY package.json package-lock.json ./
+COPY package.json pnpm-lock.yaml ./
 
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci --only=production
+RUN npm install -g pnpm && pnpm install --frozen-lockfile --prod
 
 COPY --from=builder /app/dist ./dist
 COPY config ./config
@@ -40,4 +38,4 @@ USER node
 
 EXPOSE 3000
 
-CMD ["npm", "run", "prod"]
+CMD ["npm", "start"]
