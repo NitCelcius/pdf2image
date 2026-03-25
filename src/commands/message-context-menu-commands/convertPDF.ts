@@ -510,6 +510,130 @@ const resolveUserMessage = (error: unknown): string => {
   return GENERIC_ERROR;
 };
 
+const isUnknownInteractionError = (error: unknown): boolean => {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const candidate = error as {
+    code?: unknown;
+    status?: unknown;
+    message?: unknown;
+    rawError?: { code?: unknown; message?: unknown };
+  };
+
+  return (
+    String(candidate.code) === "10062" ||
+    String(candidate.rawError?.code) === "10062" ||
+    String(candidate.message ?? "").includes("Unknown interaction") ||
+    String(candidate.rawError?.message ?? "").includes("Unknown interaction")
+  );
+};
+
+const isAlreadyAcknowledgedError = (error: unknown): boolean => {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const candidate = error as {
+    code?: unknown;
+    status?: unknown;
+    message?: unknown;
+    rawError?: { code?: unknown; message?: unknown };
+  };
+
+  return (
+    String(candidate.code) === "40060" ||
+    String(candidate.rawError?.code) === "40060" ||
+    String(candidate.message ?? "").includes("already been acknowledged") ||
+    String(candidate.rawError?.message ?? "").includes(
+      "already been acknowledged",
+    )
+  );
+};
+
+const warnAlreadyAcknowledged = (
+  interaction: MessageContextMenuCommandInteraction,
+  phase: string,
+  error: unknown,
+): void => {
+  console.warn(
+    `[Command] ${phase}: interaction already acknowledged (40060). This can indicate another bot instance or duplicate handler already responded.`,
+    {
+      interactionId: interaction.id,
+      commandName: interaction.commandName,
+      guildId: interaction.guildId,
+      channelId: interaction.channelId,
+      userId: interaction.user.id,
+      deferred: interaction.deferred,
+      replied: interaction.replied,
+      errorCode: String((error as { code?: unknown } | null)?.code ?? ""),
+      rawErrorCode: String(
+        (error as { rawError?: { code?: unknown } } | null)?.rawError?.code ??
+          "",
+      ),
+    },
+  );
+};
+
+const notifySuccessFallback = async (
+  interaction: MessageContextMenuCommandInteraction,
+  userMessage: string,
+): Promise<void> => {
+  try {
+    const targetMessage = interaction.options.getMessage("message");
+    if (targetMessage) {
+      await targetMessage.reply({
+        content: userMessage,
+        allowedMentions: { repliedUser: false },
+      });
+      return;
+    }
+  } catch (fallbackError) {
+    console.error("[Command] target message success fallback failed:", fallbackError);
+  }
+
+  try {
+    if (interaction.channel?.isSendable()) {
+      await interaction.channel.send({ content: userMessage });
+    }
+  } catch (channelFallbackError) {
+    console.error(
+      "[Command] channel success fallback failed:",
+      channelFallbackError,
+    );
+  }
+};
+
+const notifyFailureFallback = async (
+  interaction: MessageContextMenuCommandInteraction,
+  userMessage: string,
+): Promise<void> => {
+  try {
+    const targetMessage = interaction.options.getMessage("message");
+    if (targetMessage) {
+      await targetMessage.reply({
+        content: `PDF変換に失敗しました。${userMessage}`,
+        allowedMentions: { repliedUser: false },
+      });
+      return;
+    }
+  } catch (fallbackError) {
+    console.error("[Command] target message fallback failed:", fallbackError);
+  }
+
+  try {
+    if (interaction.channel?.isSendable()) {
+      await interaction.channel.send({ content: userMessage });
+    }
+  } catch (channelFallbackError) {
+    console.error(
+      "[Command] channel fallback failed:",
+      channelFallbackError,
+    );
+  }
+};
+
 export = {
   data: new ContextMenuCommandBuilder()
     .setName("convertPDF")
@@ -520,13 +644,10 @@ export = {
       `[Command] convertPDF executed in ${guildName} by ${interaction.user.tag}`,
     );
 
-    try {
-      await withTimeout(
-        interaction.deferReply({ flags: MessageFlags.Ephemeral }),
-        DISCORD_API_TIMEOUT_MS,
-      );
-
+    let canUseInteractionResponse = false;
       const targetMessage = interaction.options.getMessage("message");
+
+    try {
       if (!targetMessage) {
         throwAppError("TARGET_MESSAGE_NOT_FOUND");
       }
@@ -543,19 +664,85 @@ export = {
         );
       }
 
+      try {
+        await withTimeout(
+          interaction.deferReply({ flags: MessageFlags.Ephemeral }),
+          DISCORD_API_TIMEOUT_MS,
+        );
+        canUseInteractionResponse = true;
+      } catch (deferError) {
+        if (isUnknownInteractionError(deferError)) {
+          console.warn(
+            "[Command] deferReply skipped due to unknown interaction. Continuing with channel fallback mode.",
+          );
+          canUseInteractionResponse = false;
+        } else if (isAlreadyAcknowledgedError(deferError)) {
+          warnAlreadyAcknowledged(interaction, "deferReply", deferError);
+          console.warn(
+            "[Command] interaction was already acknowledged before deferReply. Continuing with interaction response mode.",
+          );
+          canUseInteractionResponse = true;
+        } else {
+          throw deferError;
+        }
+      }
+
       for (const attachment of pdfAttachments) {
         await processAttachment(message, attachment);
       }
 
+      const successMessage = `${pdfAttachments.length}件のPDF変換が完了しました。`;
+
+      if (canUseInteractionResponse) {
+        try {
       await withTimeout(
         interaction.editReply({
-          content: `${pdfAttachments.length}件のPDF変換が完了しました。`,
+              content: successMessage,
         }),
         DISCORD_API_TIMEOUT_MS,
       );
+        } catch (successReplyError) {
+          if (isUnknownInteractionError(successReplyError)) {
+            await notifySuccessFallback(interaction, successMessage);
+          } else {
+            throw successReplyError;
+          }
+        }
+      } else {
+        await notifySuccessFallback(interaction, successMessage);
+      }
     } catch (error) {
       console.error("[Command] convertPDF failed:", error);
       const userMessage = resolveUserMessage(error);
+
+      const interactionAlreadyAcknowledged =
+        interaction.deferred ||
+        interaction.replied ||
+        isAlreadyAcknowledgedError(error);
+
+      if (!canUseInteractionResponse || !interactionAlreadyAcknowledged) {
+        try {
+          await withTimeout(
+            interaction.reply({
+              content: userMessage,
+              flags: MessageFlags.Ephemeral,
+            }),
+            DISCORD_API_TIMEOUT_MS,
+          );
+          return;
+        } catch (replyError) {
+          console.error("[Command] reply failed:", replyError);
+
+          if (isAlreadyAcknowledgedError(replyError)) {
+            warnAlreadyAcknowledged(interaction, "reply", replyError);
+            canUseInteractionResponse = true;
+          } else {
+            await notifyFailureFallback(interaction, userMessage);
+            return;
+          }
+        }
+      }
+
       try {
         await withTimeout(
           interaction.editReply({ content: userMessage }),
@@ -576,6 +763,9 @@ export = {
           );
         } catch (followUpError) {
           console.error("[Command] followUp also failed:", followUpError);
+          if (isUnknownInteractionError(followUpError)) {
+            await notifyFailureFallback(interaction, userMessage);
+          }
         }
       }
     }
