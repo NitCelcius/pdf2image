@@ -393,35 +393,29 @@ const sendWebps = async (
     await targetMessage.channel.fetch();
   }
 
-  const firstMessageFiles = ((files.length - 1) % 9) + 1;
-  for (let i = 0, messageIndex = 0; i < files.length; messageIndex++) {
-    const chunkSize = messageIndex === 0 ? firstMessageFiles : 9;
-    const filesToSend = files.slice(i, i + chunkSize);
+  const totalMessages = Math.ceil(files.length / 10);
+  let previousMessage: Message | null = null;
+
+  for (let i = 0, messageIndex = 0; i < files.length; i += 10, messageIndex++) {
+    const filesToSend = files.slice(i, i + 10);
+    const content = totalMessages > 1 ? `(${messageIndex + 1}/${totalMessages})` : undefined;
 
     try {
-      const sendPromise =
-        messageIndex === 0
-          ? targetMessage.reply({
-              files: filesToSend,
-              allowedMentions: { repliedUser: false },
-            })
-          : (() => {
-              const sendableChannel = targetMessage.channel as {
-                send?: (options: { files: string[] }) => Promise<unknown>;
-              };
-              const send = sendableChannel.send?.bind(targetMessage.channel);
-              if (typeof send !== "function") {
-                throwAppError("CHANNEL_SEND_UNAVAILABLE");
-              }
-              return (
-                send as (options: { files: string[] }) => Promise<unknown>
-              )({ files: filesToSend });
-            })();
+      const messageOptions = {
+        content,
+        files: filesToSend,
+        allowedMentions: { repliedUser: false },
+      };
 
-      await withTimeout(
+      const sendPromise: Promise<Message> = previousMessage
+        ? previousMessage.reply(messageOptions)
+        : targetMessage.reply(messageOptions);
+
+      const sentMessage: Message = await withTimeout(
         sendPromise,
         getStepTimeoutMs(deadlineAt, PROCESS_TIMEOUT_MS),
       );
+      previousMessage = sentMessage;
     } catch (error) {
       if (error && typeof error === "object") {
         const mapped =
@@ -433,8 +427,6 @@ const sendWebps = async (
       }
       throw error;
     }
-
-    i += chunkSize;
   }
 };
 
@@ -645,7 +637,7 @@ export = {
     );
 
     let canUseInteractionResponse = false;
-      const targetMessage = interaction.options.getMessage("message");
+    const targetMessage = interaction.options.getMessage("message");
 
     try {
       if (!targetMessage) {
@@ -695,12 +687,12 @@ export = {
 
       if (canUseInteractionResponse) {
         try {
-      await withTimeout(
-        interaction.editReply({
+          await withTimeout(
+            interaction.editReply({
               content: successMessage,
-        }),
-        DISCORD_API_TIMEOUT_MS,
-      );
+            }),
+            DISCORD_API_TIMEOUT_MS,
+          );
         } catch (successReplyError) {
           if (isUnknownInteractionError(successReplyError)) {
             await notifySuccessFallback(interaction, successMessage);
