@@ -280,6 +280,47 @@ const convertPdfToWebps = async (
     }
   };
 
+  const runGhostscriptFallback = async (density: number): Promise<string[]> => {
+    const pngPattern = path.join(imageDir, `${originalFilename}_page_%03d.png`);
+
+    await execFileAsync(
+      "gs",
+      [
+        "-dSAFER",
+        "-dBATCH",
+        "-dNOPAUSE",
+        "-dNOPROMPT",
+        "-sDEVICE=png16m",
+        `-r${density}`,
+        "-o",
+        pngPattern,
+        pdfPath,
+      ],
+      {
+        timeout: getStepTimeoutMs(deadlineAt, CONVERT_TIMEOUT_MS),
+      },
+    );
+
+    const pngFiles = await listGeneratedPngs(imageDir);
+    if (pngFiles.length === 0) {
+      throwAppError("UPLOAD_GENERATION_FAILED");
+    }
+
+    for (const pngPath of pngFiles) {
+      const webpPath = pngPath.replace(/\.png$/i, ".webp");
+      await execFileAsync(
+        "convert",
+        ["-alpha", "remove", pngPath, webpPath],
+        {
+          timeout: getStepTimeoutMs(deadlineAt, CONVERT_TIMEOUT_MS),
+        },
+      );
+    }
+
+    await clearGeneratedPngs(imageDir);
+    return listGeneratedWebps(imageDir);
+  };
+
   try {
     await runConvert(initialDensity);
     return listGeneratedWebps(imageDir);
