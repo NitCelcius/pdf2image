@@ -190,6 +190,13 @@ const isResourceLimitError = (error: unknown): boolean => {
   );
 };
 
+const isPdfSecurityPolicyError = (error: unknown): boolean => {
+  const message = `${error instanceof Error ? error.message : ""}\n${(error as { stderr?: unknown })?.stderr ?? ""}`;
+  return /operation not allowed by the security policy [`'"]?PDF/i.test(
+    message,
+  );
+};
+
 const listGeneratedWebps = async (imageDir: string): Promise<string[]> => {
   return (await fs.readdir(imageDir))
     .filter((file) => file.endsWith(".webp"))
@@ -325,6 +332,15 @@ const convertPdfToWebps = async (
     await runConvert(initialDensity);
     return listGeneratedWebps(imageDir);
   } catch (error) {
+    if (isPdfSecurityPolicyError(error)) {
+      console.warn(
+        "[Convert] PDF policy blocked in ImageMagick. Falling back to Ghostscript.",
+      );
+      await clearGeneratedWebps(imageDir);
+      await clearGeneratedPngs(imageDir);
+      return runGhostscriptFallback(initialDensity);
+    }
+
     const retryDensity =
       initialDensity > MEDIUM_DENSITY
         ? MEDIUM_DENSITY
@@ -340,6 +356,15 @@ const convertPdfToWebps = async (
       await runConvert(retryDensity);
       return listGeneratedWebps(imageDir);
     } catch (retryError) {
+      if (isPdfSecurityPolicyError(retryError)) {
+        console.warn(
+          "[Convert] PDF policy blocked after retry. Falling back to Ghostscript.",
+        );
+        await clearGeneratedWebps(imageDir);
+        await clearGeneratedPngs(imageDir);
+        return runGhostscriptFallback(retryDensity);
+      }
+
       if (!isResourceLimitError(retryError)) {
         console.error("[Convert] Failed after retry:", retryError);
         throw retryError;
