@@ -197,10 +197,25 @@ const listGeneratedWebps = async (imageDir: string): Promise<string[]> => {
     .map((file) => path.join(imageDir, file));
 };
 
+const listGeneratedPngs = async (imageDir: string): Promise<string[]> => {
+  return (await fs.readdir(imageDir))
+    .filter((file) => file.endsWith(".png"))
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+    .map((file) => path.join(imageDir, file));
+};
+
 const clearGeneratedWebps = async (imageDir: string): Promise<void> => {
   await Promise.all(
     (await fs.readdir(imageDir))
       .filter((file) => file.endsWith(".webp"))
+      .map((file) => fs.unlink(path.join(imageDir, file)).catch(() => {})),
+  );
+};
+
+const clearGeneratedPngs = async (imageDir: string): Promise<void> => {
+  await Promise.all(
+    (await fs.readdir(imageDir))
+      .filter((file) => file.endsWith(".png"))
       .map((file) => fs.unlink(path.join(imageDir, file)).catch(() => {})),
   );
 };
