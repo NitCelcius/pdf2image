@@ -1,4 +1,3 @@
-import { execFile } from "child_process";
 import {
   ApplicationCommandType,
   ContextMenuCommandBuilder,
@@ -14,12 +13,11 @@ import https from "https";
 import os from "os";
 import path from "path";
 import { pipeline } from "stream/promises";
-import { promisify } from "util";
-
-const execFileAsync = promisify(execFile);
+import { createConverter } from "../../converters";
+import type { AppErrorCode } from "../../converters";
+import { getStepTimeoutMs, throwAppError } from "../../converters/types";
 
 const DOWNLOAD_TIMEOUT_MS = 120_000;
-const CONVERT_TIMEOUT_MS = 120_000;
 const PROCESS_TIMEOUT_MS = 10 * 60 * 1000;
 const DISCORD_API_TIMEOUT_MS = 30_000;
 const MAX_BASE_FILENAME_LENGTH = 64;
@@ -27,7 +25,6 @@ const MAX_BASE_FILENAME_LENGTH = 64;
 const LOW_DENSITY = 100;
 const MEDIUM_DENSITY = 200;
 const DEFAULT_DENSITY = 300;
-const CONVERT_BATCH_SIZE = 32;
 
 const CHECK_BOT_PERMISSIONS_MESSAGE = "Botの権限設定を確認してください。";
 const GENERIC_ERROR =
@@ -53,9 +50,7 @@ const APP_ERROR_MESSAGES = {
   CHANNEL_INFO_FAILED:
     "チャンネル情報の取得に失敗しました。\nもう一度お試しください。",
   RATE_LIMIT: "送信が混み合っています。時間をおいて再試行してください。",
-} as const;
-
-type AppErrorCode = keyof typeof APP_ERROR_MESSAGES;
+} as const satisfies Record<AppErrorCode, string>;
 
 const DISCORD_ERROR_MAP: Record<string, AppErrorCode> = {
   "50001": "BOT_SEND_PERMISSION",
@@ -66,33 +61,10 @@ const DISCORD_ERROR_MAP: Record<string, AppErrorCode> = {
   "413": "IMAGE_TOO_LARGE",
 };
 
-const throwAppError = (code: AppErrorCode): never => {
-  throw { code };
-};
-
-const getStepTimeoutMs = (deadlineAt: number, maxTimeoutMs: number): number => {
-  const remainingMs = deadlineAt - Date.now();
-  if (remainingMs <= 0) {
-    throwAppError("PROCESS_TIMEOUT");
-  }
-  return Math.min(remainingMs, maxTimeoutMs);
-};
-
-const withTimeout = async <T>(
-  promise: Promise<T>,
-  timeoutMs: number,
-): Promise<T> => {
-  const timeoutPromise = new Promise<T>((_, reject) => {
-    const timer = setTimeout(
-      () => reject({ code: "PROCESS_TIMEOUT" as const }),
-      timeoutMs,
-    );
-    if (typeof timer.unref === "function") {
-      timer.unref();
-    }
-  });
-
-  return Promise.race([promise, timeoutPromise]);
+const chooseDensity = (sizeBytes: number): number => {
+  if (sizeBytes >= 60 * 1024 * 1024) return LOW_DENSITY;
+  if (sizeBytes >= 30 * 1024 * 1024) return MEDIUM_DENSITY;
+  return DEFAULT_DENSITY;
 };
 
 const isPdfAttachment = (attachment: Attachment): boolean => {
@@ -113,14 +85,20 @@ const sanitizeBaseFilename = (filename?: string): string => {
   return (sanitized || "file").slice(0, MAX_BASE_FILENAME_LENGTH);
 };
 
-const chooseDensity = (sizeBytes: number): number => {
-  if (sizeBytes >= 60 * 1024 * 1024) {
-    return LOW_DENSITY;
-  }
-  if (sizeBytes >= 30 * 1024 * 1024) {
-    return MEDIUM_DENSITY;
-  }
-  return DEFAULT_DENSITY;
+const withTimeout = async <T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<T> => {
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    const timer = setTimeout(
+      () => reject({ code: "PROCESS_TIMEOUT" as const }),
+      timeoutMs,
+    );
+    if (typeof timer.unref === "function") {
+      timer.unref();
+    }
+  });
+  return Promise.race([promise, timeoutPromise]);
 };
 
 const downloadPdf = async (
@@ -146,9 +124,7 @@ const downloadPdf = async (
         ) {
           console.error(
             `[Download] Failed with status code: ${response.statusCode}`,
-            {
-              statusCode: response.statusCode,
-            },
+            { statusCode: response.statusCode },
           );
           response.resume();
           await cleanupFile();
@@ -183,199 +159,6 @@ const downloadPdf = async (
   });
 };
 
-const isResourceLimitError = (error: unknown): boolean => {
-  const message = `${error instanceof Error ? error.message : ""}\n${(error as { stderr?: unknown })?.stderr ?? ""}`;
-  return /cache resources exhausted|TooManyExceptions|IDAT: Too much image data/i.test(
-    message,
-  );
-};
-
-const isPdfSecurityPolicyError = (error: unknown): boolean => {
-  const message = `${error instanceof Error ? error.message : ""}\n${(error as { stderr?: unknown })?.stderr ?? ""}`;
-  return /operation not allowed by the security policy [`'"]?PDF/i.test(
-    message,
-  );
-};
-
-const listGeneratedWebps = async (imageDir: string): Promise<string[]> => {
-  return (await fs.readdir(imageDir))
-    .filter((file) => file.endsWith(".webp"))
-    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
-    .map((file) => path.join(imageDir, file));
-};
-
-const listGeneratedPngs = async (imageDir: string): Promise<string[]> => {
-  return (await fs.readdir(imageDir))
-    .filter((file) => file.endsWith(".png"))
-    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
-    .map((file) => path.join(imageDir, file));
-};
-
-const clearGeneratedWebps = async (imageDir: string): Promise<void> => {
-  await Promise.all(
-    (await fs.readdir(imageDir))
-      .filter((file) => file.endsWith(".webp"))
-      .map((file) => fs.unlink(path.join(imageDir, file)).catch(() => {})),
-  );
-};
-
-const clearGeneratedPngs = async (imageDir: string): Promise<void> => {
-  await Promise.all(
-    (await fs.readdir(imageDir))
-      .filter((file) => file.endsWith(".png"))
-      .map((file) => fs.unlink(path.join(imageDir, file)).catch(() => {})),
-  );
-};
-
-const getPdfPageCount = async (
-  pdfPath: string,
-  deadlineAt: number,
-): Promise<number> => {
-  const { stdout } = await execFileAsync(
-    "identify",
-    ["-ping", "-format", "%p\n", pdfPath],
-    {
-      timeout: getStepTimeoutMs(deadlineAt, CONVERT_TIMEOUT_MS),
-    },
-  );
-  const pageCount = String(stdout)
-    .split("\n")
-    .filter((line) => line.trim() !== "").length;
-  return Math.max(pageCount, 1);
-};
-
-const convertPdfToWebps = async (
-  pdfPath: string,
-  imageDir: string,
-  originalFilename: string,
-  initialDensity: number,
-  deadlineAt: number,
-): Promise<string[]> => {
-  const outputPattern = path.join(
-    imageDir,
-    `${originalFilename}_page_%03d.webp`,
-  );
-
-  const runConvert = async (density: number): Promise<void> => {
-    await execFileAsync(
-      "convert",
-      ["-density", String(density), "-alpha", "remove", pdfPath, outputPattern],
-      {
-        timeout: getStepTimeoutMs(deadlineAt, CONVERT_TIMEOUT_MS),
-      },
-    );
-  };
-
-  const runBatchedConvert = async (density: number): Promise<void> => {
-    const pageCount = await getPdfPageCount(pdfPath, deadlineAt);
-    for (let start = 0; start < pageCount; start += CONVERT_BATCH_SIZE) {
-      const end = Math.min(start + CONVERT_BATCH_SIZE - 1, pageCount - 1);
-      await execFileAsync(
-        "convert",
-        [
-          "-density",
-          String(density),
-          "-alpha",
-          "remove",
-          `${pdfPath}[${start}-${end}]`,
-          "-scene",
-          String(start),
-          outputPattern,
-        ],
-        { timeout: getStepTimeoutMs(deadlineAt, CONVERT_TIMEOUT_MS) },
-      );
-    }
-  };
-
-  const runGhostscriptFallback = async (density: number): Promise<string[]> => {
-    const pngPattern = path.join(imageDir, `${originalFilename}_page_%03d.png`);
-
-    await execFileAsync(
-      "gs",
-      [
-        "-dSAFER",
-        "-dBATCH",
-        "-dNOPAUSE",
-        "-dNOPROMPT",
-        "-sDEVICE=png16m",
-        `-r${density}`,
-        "-o",
-        pngPattern,
-        pdfPath,
-      ],
-      {
-        timeout: getStepTimeoutMs(deadlineAt, CONVERT_TIMEOUT_MS),
-      },
-    );
-
-    const pngFiles = await listGeneratedPngs(imageDir);
-    if (pngFiles.length === 0) {
-      throwAppError("UPLOAD_GENERATION_FAILED");
-    }
-
-    for (const pngPath of pngFiles) {
-      const webpPath = pngPath.replace(/\.png$/i, ".webp");
-      await execFileAsync(
-        "convert",
-        ["-alpha", "remove", pngPath, webpPath],
-        {
-          timeout: getStepTimeoutMs(deadlineAt, CONVERT_TIMEOUT_MS),
-        },
-      );
-    }
-
-    await clearGeneratedPngs(imageDir);
-    return listGeneratedWebps(imageDir);
-  };
-
-  try {
-    await runConvert(initialDensity);
-    return listGeneratedWebps(imageDir);
-  } catch (error) {
-    if (isPdfSecurityPolicyError(error)) {
-      console.warn(
-        "[Convert] PDF policy blocked in ImageMagick. Falling back to Ghostscript.",
-      );
-      await clearGeneratedWebps(imageDir);
-      await clearGeneratedPngs(imageDir);
-      return runGhostscriptFallback(initialDensity);
-    }
-
-    const retryDensity =
-      initialDensity > MEDIUM_DENSITY
-        ? MEDIUM_DENSITY
-        : initialDensity > LOW_DENSITY
-          ? LOW_DENSITY
-          : null;
-    if (retryDensity === null || !isResourceLimitError(error)) {
-      console.error("[Convert] Failed:", error);
-      throw error;
-    }
-    await clearGeneratedWebps(imageDir);
-    try {
-      await runConvert(retryDensity);
-      return listGeneratedWebps(imageDir);
-    } catch (retryError) {
-      if (isPdfSecurityPolicyError(retryError)) {
-        console.warn(
-          "[Convert] PDF policy blocked after retry. Falling back to Ghostscript.",
-        );
-        await clearGeneratedWebps(imageDir);
-        await clearGeneratedPngs(imageDir);
-        return runGhostscriptFallback(retryDensity);
-      }
-
-      if (!isResourceLimitError(retryError)) {
-        console.error("[Convert] Failed after retry:", retryError);
-        throw retryError;
-      }
-      await clearGeneratedWebps(imageDir);
-      await runBatchedConvert(retryDensity);
-      return listGeneratedWebps(imageDir);
-    }
-  }
-};
-
 const sendWebps = async (
   targetMessage: Message,
   files: string[],
@@ -398,7 +181,8 @@ const sendWebps = async (
 
   for (let i = 0, messageIndex = 0; i < files.length; i += 10, messageIndex++) {
     const filesToSend = files.slice(i, i + 10);
-    const content = totalMessages > 1 ? `(${messageIndex + 1}/${totalMessages})` : undefined;
+    const content =
+      totalMessages > 1 ? `(${messageIndex + 1}/${totalMessages})` : undefined;
 
     try {
       const messageOptions = {
@@ -451,13 +235,18 @@ const processAttachment = async (
       pdfPath,
       getStepTimeoutMs(deadlineAt, DOWNLOAD_TIMEOUT_MS),
     );
-    const generatedFiles = await convertPdfToWebps(
-      pdfPath,
-      imageDir,
-      originalFilename,
-      chooseDensity(attachment.size),
+
+    const converter = createConverter(process.env.PDF_CONVERSION_TOOL);
+    console.log(`[Convert] Using converter: ${converter.name}`);
+
+    const generatedFiles = await converter.convert({
+      inputPath: pdfPath,
+      outputDir: imageDir,
+      outputPrefix: originalFilename,
+      density: chooseDensity(attachment.size),
       deadlineAt,
-    );
+    });
+
     await sendWebps(targetMessage, generatedFiles, deadlineAt);
   } catch (error) {
     console.error(`[Process] Failed processing ${attachment.name}:`, error);
@@ -503,44 +292,32 @@ const resolveUserMessage = (error: unknown): string => {
 };
 
 const isUnknownInteractionError = (error: unknown): boolean => {
-  if (!error || typeof error !== "object") {
-    return false;
-  }
-
-  const candidate = error as {
+  if (!error || typeof error !== "object") return false;
+  const c = error as {
     code?: unknown;
-    status?: unknown;
     message?: unknown;
     rawError?: { code?: unknown; message?: unknown };
   };
-
   return (
-    String(candidate.code) === "10062" ||
-    String(candidate.rawError?.code) === "10062" ||
-    String(candidate.message ?? "").includes("Unknown interaction") ||
-    String(candidate.rawError?.message ?? "").includes("Unknown interaction")
+    String(c.code) === "10062" ||
+    String(c.rawError?.code) === "10062" ||
+    String(c.message ?? "").includes("Unknown interaction") ||
+    String(c.rawError?.message ?? "").includes("Unknown interaction")
   );
 };
 
 const isAlreadyAcknowledgedError = (error: unknown): boolean => {
-  if (!error || typeof error !== "object") {
-    return false;
-  }
-
-  const candidate = error as {
+  if (!error || typeof error !== "object") return false;
+  const c = error as {
     code?: unknown;
-    status?: unknown;
     message?: unknown;
     rawError?: { code?: unknown; message?: unknown };
   };
-
   return (
-    String(candidate.code) === "40060" ||
-    String(candidate.rawError?.code) === "40060" ||
-    String(candidate.message ?? "").includes("already been acknowledged") ||
-    String(candidate.rawError?.message ?? "").includes(
-      "already been acknowledged",
-    )
+    String(c.code) === "40060" ||
+    String(c.rawError?.code) === "40060" ||
+    String(c.message ?? "").includes("already been acknowledged") ||
+    String(c.rawError?.message ?? "").includes("already been acknowledged")
   );
 };
 
@@ -582,7 +359,10 @@ const notifySuccessFallback = async (
       return;
     }
   } catch (fallbackError) {
-    console.error("[Command] target message success fallback failed:", fallbackError);
+    console.error(
+      "[Command] target message success fallback failed:",
+      fallbackError,
+    );
   }
 
   try {
@@ -619,10 +399,7 @@ const notifyFailureFallback = async (
       await interaction.channel.send({ content: userMessage });
     }
   } catch (channelFallbackError) {
-    console.error(
-      "[Command] channel fallback failed:",
-      channelFallbackError,
-    );
+    console.error("[Command] channel fallback failed:", channelFallbackError);
   }
 };
 
@@ -688,9 +465,7 @@ export = {
       if (canUseInteractionResponse) {
         try {
           await withTimeout(
-            interaction.editReply({
-              content: successMessage,
-            }),
+            interaction.editReply({ content: successMessage }),
             DISCORD_API_TIMEOUT_MS,
           );
         } catch (successReplyError) {
